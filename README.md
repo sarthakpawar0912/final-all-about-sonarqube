@@ -1,7 +1,7 @@
 # 🔍 Final SonarQube Guide — Bus Ticket Booking System
 
 > **Project:** bus-ticket-booking-system · **SonarQube:** 26.4.0.121862 Community · **Java:** 21 · **MySQL:** 8.0 · **Stack:** Spring Boot 3.3.5, Thymeleaf, JaCoCo, JUnit 5, Mockito
-> **Result:** 119 issues → 55 → 15 → 2 (Round 4 security-hardening pass) → 2 (Round 5 registry literal cleanup) → 4 hotspots reviewed (Round 6: 1 CSRF + 3 SRI, all **Safe** with written justifications) → **Quality Gate PASSED** · Security Rating A · Hotspots Reviewed 100% · Coverage 50.9% · 0 new issues · 314 tests passing · 9.3k LoC
+> **Result:** 119 issues → 55 → 15 → 2 (Round 4 security-hardening pass) → 2 (Round 5 registry literal cleanup) → 4 hotspots resolved (Round 6: 1 CSRF reviewed Safe + 2 Bootstrap CDN tags code-fixed with SRI hashes + 1 icons CSS reviewed Safe) → **Quality Gate PASSED** · Security Rating A · Hotspots Reviewed 100% · Coverage 50.9% · 0 new issues · 314 tests passing · 9.3k LoC
 
 ---
 
@@ -2663,7 +2663,60 @@ Difference from Issues:
     Hotspot  — Sonar is uncertain: "this MIGHT be a problem, judge it."
 ```
 
-**Result of Round 6:** Security Hotspots Reviewed: **100%**. Security Rating: **A**. Quality Gate: **Passed**. 0 new issues. Coverage 50.9%. 9.3k LoC. 314 tests green.
+### 3.6.5 Actually Applying SRI — Upgrading 2 Hotspots from "Safe" to Code-Fixed
+
+After the first Round 6 review pass (everything marked **Safe**), we did one extra hardening step: **added real SRI hashes** to the two Bootstrap CDN tags where official hashes are published.
+
+**Files changed:**
+
+1. `fragments/header.html` line 8 — Bootstrap CSS:
+
+```html
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css"
+      rel="stylesheet"
+      integrity="sha384-T3c6CoIi6uLrA9TneNEoa7RxnatzjcDSCmG1MXxSR1GAsXEV/Dwwykc2MPK8M2HN"
+      crossorigin="anonymous">
+```
+
+2. `fragments/footer.html` line 14 — Bootstrap JS:
+
+```html
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"
+        integrity="sha384-C6RzsynM9kWDrMNeT87bh95OGNyZPhcTNXj1NW7RuBCsyN/o0jlpcV8Qyq46cDfL"
+        crossorigin="anonymous"></script>
+```
+
+**Bootstrap Icons kept as Safe** — no official SRI hash is published, and self-hosting the font + CSS wasn't justified for this project.
+
+**Dashboard effect:** after re-scan, the 2 CDN tags with SRI attributes **dropped off the hotspot list entirely** — Sonar only flags the missing-SRI case, so adding SRI silently resolves the hotspot. Total hotspot count went from 4 → 2.
+
+### 3.6.6 Final Hotspot State — 100% Reviewed
+
+After adding SRI + reviewing the last two remaining hotspots:
+
+| # | Hotspot | File | Rule | Final Status |
+|---|---|---|---|---|
+| 1 | CSRF disabled on `/api/**` | `SecurityConfig.java` | `java:S4502` | **Safe** (with full justification comment) |
+| 2 | Missing SRI on `bootstrap-icons.min.css` | `fragments/header.html` | `Web:S5725` | **Safe** (no official hash, version-pinned, HTTPS) |
+| 3 | Missing SRI on `bootstrap.min.css` | `fragments/header.html` | `Web:S5725` | **Code-Fixed** (SRI hash added — dropped off list) |
+| 4 | Missing SRI on `bootstrap.bundle.min.js` | `fragments/footer.html` | `Web:S5725` | **Code-Fixed** (SRI hash added — dropped off list) |
+
+### 3.6.7 Small UX Gotcha We Hit — "Unable to Change Status"
+
+While reviewing the CSRF hotspot, the **Submit** button stayed grayed out even after typing the comment. Wasted a minute. Cause: in SonarQube's Review dialog, the four statuses (`To review`, `Acknowledged`, `Fixed`, `Safe`) each have a **radio button** on the left that you have to click. The text labels look clickable but aren't — only the ⚪ radio dot registers. Once Safe was actually selected (radio filled in), Submit activated.
+
+**Backup route if UI still fails** — the REST API:
+
+```powershell
+$token = "sqa_..."
+$auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${token}:"))
+Invoke-RestMethod -Uri "http://localhost:9000/api/hotspots/change_status" `
+    -Method POST `
+    -Headers @{ Authorization = "Basic $auth" } `
+    -Body @{ hotspot = "HOTSPOT_KEY"; status = "REVIEWED"; resolution = "SAFE"; comment = "..." }
+```
+
+**Result of Round 6 (final):** Security Hotspots Reviewed: **100%** (2 Safe + 2 Code-Fixed = 4/4). Security Rating: **A**. Quality Gate: **Passed** on both New Code and Overall Code. 0 new issues. Coverage 50.9%. 9.3k LoC. 314 tests green.
 
 ---
 
@@ -2706,9 +2759,11 @@ Difference from Issues:
 | Duplicate literal "1,2,3" (MemberRegistry) | 5 | `java:S1192` | 1 | Extract `SAMPLE_ID_CSV` constant |
 | Duplicate literal "Open Lookup" (TeamRegistry) | 5 | `java:S1192` | 1 | Extract `LBL_OPEN_LOOKUP` constant |
 | CSRF disabled on `/api/**` chain | 6 (hotspot) | `java:S4502` | 1 | Reviewed **Safe** — stateless + Basic + CORS allowlist |
-| Missing SRI on jsdelivr CDN links | 6 (hotspot) | `Web:S5725` | 3 | Reviewed **Safe** — version-pinned, HTTPS, internal deploy |
+| Missing SRI on Bootstrap CSS | 6 (hotspot) | `Web:S5725` | 1 | **Code-Fixed** — added `integrity="sha384-..."` + `crossorigin="anonymous"` |
+| Missing SRI on Bootstrap JS bundle | 6 (hotspot) | `Web:S5725` | 1 | **Code-Fixed** — added `integrity="sha384-..."` + `crossorigin="anonymous"` |
+| Missing SRI on Bootstrap Icons CSS | 6 (hotspot) | `Web:S5725` | 1 | Reviewed **Safe** — no official hash; version-pinned + HTTPS |
 
-**Total: 169 individual artefacts resolved across 6 rounds — 165 Issues + 4 Hotspots. 314 tests passing, 0 new Issues, 100% Hotspots Reviewed, Security Rating A, Quality Gate PASSED.**
+**Total: 169 individual artefacts resolved across 6 rounds — 165 Issues + 4 Hotspots (2 code-fixed + 2 reviewed Safe). 314 tests passing, 0 new Issues, 100% Hotspots Reviewed, Security Rating A, Quality Gate PASSED on both New Code and Overall Code.**
 
 ## 3.8 How to Avoid Common Issues in a Future Spring Boot Project
 
@@ -3578,7 +3633,22 @@ Yes — `POST /api/hotspots/change_status?hotspot=KEY&status=REVIEWED&resolution
 In `SecurityConfig.java`, directly above `.csrf(csrf -> csrf.disable())`. The comment explains the stateless + Basic + CORS reasoning so any future reader understands without digging through SonarQube history.
 
 **Q265. Security Rating and Hotspots — final state?**
-Security Rating: **A**. Hotspots Reviewed: **100%** (4/4 marked Safe). Quality Gate: **Passed** across both New Code and Overall Code. Activity timeline shows April 21 at 07:46 was the first green scan after Round 5, with Round 6 hotspot reviews completing the journey.
+Security Rating: **A**. Hotspots Reviewed: **100%** (4/4 — 2 reviewed Safe + 2 code-fixed via SRI hashes on the Bootstrap CSS/JS CDN tags). Quality Gate: **Passed** across both New Code and Overall Code. Activity timeline shows April 21 at 07:46 was the first green scan after Round 5, with Round 6 hotspot reviews + SRI code fix completing the journey.
+
+**Q266. What's the difference between a code-fixed hotspot and a Safe hotspot?**
+**Code-fixed** — the actual source was modified to remove the sensitivity (e.g. added `integrity="sha384-..."` to the CDN tag). On re-scan, Sonar no longer flags it — the hotspot disappears from the dashboard list entirely. **Safe** — the source stays the same, but a human marked it as not-a-risk-in-this-context. The hotspot stays on the list under the "Safe" filter for audit history.
+
+**Q267. Why did 2 of your 3 SRI hotspots go code-fixed but 1 stayed Safe?**
+Bootstrap CSS and Bootstrap JS both publish official SRI hashes at `getbootstrap.com` — we pasted those in. Bootstrap Icons doesn't publish an official SRI, so rather than guessing a hash (which would break the page if wrong), we kept it as Safe with a justification. Self-hosting the icons was the alternative but overkill for this project.
+
+**Q268. You hit "Unable to change status" in the Review dialog — what was the bug?**
+Not a bug — UX. SonarQube's status dialog lists the 4 options as labelled descriptions that *look* clickable, but only the radio-button circle (⚪) on the left registers as "selected". Clicking the label text alone doesn't fill in the radio. Submit stays disabled until one is actually selected.
+
+**Q269. How do you change a hotspot's status via the API instead of the UI?**
+`POST /api/hotspots/change_status` with body params `hotspot=<key>&status=REVIEWED&resolution=SAFE&comment=...`. Use a global analysis token via HTTP Basic in the `Authorization` header. Useful when the UI misbehaves or for bulk automated review in CI.
+
+**Q270. If you add SRI and jsdelivr later rebuilds the file, what breaks?**
+The browser blocks the resource — SHA-384 mismatch. Page loads without Bootstrap styling / JS. Devtools Console shows `Failed to find a valid digest in the 'integrity' attribute`. Fix: update the hash to match the new file, OR pin to a different version that the CDN won't rebuild (`bootstrap@5.3.2` has never changed bytes in jsdelivr's history).
 
 ---
 
