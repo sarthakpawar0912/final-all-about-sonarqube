@@ -1,7 +1,7 @@
 # 🔍 Final SonarQube Guide — Bus Ticket Booking System
 
 > **Project:** bus-ticket-booking-system · **SonarQube:** 26.4.0.121862 Community · **Java:** 21 · **MySQL:** 8.0 · **Stack:** Spring Boot 3.3.5, Thymeleaf, JaCoCo, JUnit 5, Mockito
-> **Result:** 119 issues → 55 → 15 → 2 (Round 4 security-hardening pass) → 2 (Round 5 registry literal cleanup) → **Quality Gate PASSED** · Coverage 50.9% · 0 new issues · 314 tests passing · 9.3k LoC
+> **Result:** 119 issues → 55 → 15 → 2 (Round 4 security-hardening pass) → 2 (Round 5 registry literal cleanup) → 4 hotspots reviewed (Round 6: 1 CSRF + 3 SRI, all **Safe** with written justifications) → **Quality Gate PASSED** · Security Rating A · Hotspots Reviewed 100% · Coverage 50.9% · 0 new issues · 314 tests passing · 9.3k LoC
 
 ---
 
@@ -2567,7 +2567,107 @@ private static final String LBL_OPEN_LOOKUP = LBL_OPEN_LOOKUP;  // compile error
 
 ---
 
-## 3.6 Summary Table — All Issues Resolved
+## 3.6 Round 6 — Security Hotspots Reviewed (2026-04-21)
+
+Unlike Rounds 1–5 which resolved **Issues** (bugs / code smells / duplicates), Round 6 deals with **Security Hotspots** — the fourth Sonar artefact type. Hotspots are security-sensitive code patterns that SonarQube cannot prove are exploitable on its own; they need a human to review the *context* and mark each one **Safe**, **Acknowledged**, or **Fixed**. Until every hotspot is reviewed, the Security Rating stays at **B** (or worse), and the Quality Gate's "Security Hotspots Reviewed = 100%" condition fails.
+
+Our scan produced **4 hotspots total** — 1 CSRF, 3 Subresource-Integrity. After review, all 4 are marked **Safe** with written justifications, moving the **Security Hotspots Reviewed metric from 0% → 100%** and the Security Rating back to **A**.
+
+### 3.6.1 Hotspot #1 — CSRF Disabled in REST Chain
+
+**Rule:** `java:S4502` — "Disabling Spring Security's CSRF protection is security-sensitive"
+**Category:** Cross-Site Request Forgery · **Review priority:** High
+
+**File:** `config/SecurityConfig.java` inside `apiSecurityFilterChain()`:
+
+```java
+.csrf(csrf -> csrf.disable())
+```
+
+**Why Sonar flags it:** CSRF (Cross-Site Request Forgery) attacks work when a browser auto-sends a credential (session cookie, cached HTTP Basic, client cert) to a state-changing endpoint on a target site, triggered by a forged request on a malicious site the victim is visiting. Disabling Spring's CSRF filter removes the token-based defence against this — so Sonar requires a human to confirm disabling is safe in *this specific context*.
+
+**Why it's Safe on this chain specifically:**
+
+1. **`SessionCreationPolicy.STATELESS`** — no `JSESSIONID` cookie is ever created, so the browser has no session credential to auto-attach to a forged request.
+2. **HTTP Basic via `Authorization` header** — browsers do **not** automatically send this header on cross-origin requests. It only gets sent if JavaScript explicitly sets it (`fetch(..., { credentials: 'include' })`), and that path is gated by CORS.
+3. **CORS origin allowlist** — `CorsConfigurationSource` only accepts origins from `APP_CORS_ORIGINS` (defaults to `http://localhost:8081`). A malicious site at `evil.com` can't even pass preflight.
+4. **Form-login / browser-session views still protected** — they run under the separate `webSecurityFilterChain` which keeps CSRF **enabled**. So the only chain that disables CSRF is also the only one that can't be CSRF-attacked.
+
+**How we marked it:** Dashboard → Security Hotspots → CSRF hotspot → Change Status → **Safe** → paste the justification above. Plus an inline code comment so future readers don't wonder:
+
+```java
+// CSRF disabled is SAFE here: stateless session (no JSESSIONID cookie),
+// HTTP Basic auth (Authorization header is NOT auto-sent cross-origin
+// by browsers), and CORS restricted to an explicit origin allowlist.
+// A CSRF attack requires the browser to auto-attach a credential —
+// none of our auth mechanisms qualify.
+.csrf(csrf -> csrf.disable())
+```
+
+### 3.6.2 Hotspots #2–#4 — Subresource Integrity Missing on CDN Resources
+
+**Rule:** `Web:S5725` — "Using remote artifacts without integrity checks is security-sensitive"
+**Category:** Others · **Review priority:** Low
+
+**Files:** three CDN references pulled from `cdn.jsdelivr.net` without an `integrity="sha384-..."` attribute:
+
+1. `fragments/header.html:8` — `bootstrap@5.3.2/dist/css/bootstrap.min.css`
+2. `fragments/header.html:10` — `bootstrap-icons@1.11.3/font/bootstrap-icons.min.css`
+3. `fragments/footer.html:14` — `bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js`
+
+**Why Sonar flags it:** If the CDN is ever compromised (DNS hijack, supply-chain attack on jsdelivr's infrastructure, malicious rebuild), a modified file would be served to our users without the browser noticing. An SRI hash (`integrity="sha384-..."`) tells the browser "only run this file if its SHA-384 matches" — a mismatch causes the resource to be rejected outright.
+
+**Why it's Safe in our context:**
+
+1. **Version-pinned URLs** — we reference `bootstrap@5.3.2` and `bootstrap-icons@1.11.3` as exact versions, not `latest`. jsdelivr's versioning policy is immutable: once `5.3.2` is published, it's never republished with different bytes.
+2. **jsdelivr track record** — zero documented supply-chain compromises since launch (2013). It's a reputable, widely used CDN.
+3. **HTTPS enforces transport integrity** — TLS guarantees the bytes we receive are what the CDN sent; the only remaining threat is the CDN itself being compromised.
+4. **Threat model** — this is an internal/college project, not a public site handling payments or sensitive data. The risk-vs-effort of retrofitting SRI hashes for three files is not justified for the current deployment profile.
+
+**How we marked it:** Dashboard → Security Hotspots → each SRI hotspot → Change Status → **Safe** → short justification ("Version-pinned jsdelivr URL, served over HTTPS, internal deployment").
+
+### 3.6.3 Optional Upgrade — From "Safe" to "Fixed"
+
+Marking as **Safe** is the lightweight answer. If the project moves to production, swap **Safe** for **Fixed** by adding SRI hashes. Bootstrap 5.3.2's hashes (from the official `getbootstrap.com` docs) are:
+
+```html
+<!-- fragments/header.html -->
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css"
+      rel="stylesheet"
+      integrity="sha384-T3c6CoIi6uLrA9TneNEoa7RxnatzjcDSCmG1MXxSR1GAsXEV/Dwwykc2MPK8M2HN"
+      crossorigin="anonymous">
+
+<!-- fragments/footer.html -->
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"
+        integrity="sha384-C6RzsynM9kWDrMNeT87bh95OGNyZPhcTNXj1NW7RuBCsyN/o0jlpcV8Qyq46cDfL"
+        crossorigin="anonymous"></script>
+```
+
+For `bootstrap-icons@1.11.3` there's no officially published SRI. Two routes:
+1. Grab the hash from `https://www.jsdelivr.com/package/npm/bootstrap-icons?version=1.11.3` (the file list shows SRI for each file).
+2. **Self-host** — download the `bootstrap-icons.min.css` + the four font files (`bootstrap-icons.woff`, `.woff2`) into `src/main/resources/static/icons/` and point the `<link>` at `/icons/bootstrap-icons.min.css`. No SRI needed — local files are inherently integrity-checked by the filesystem.
+
+### 3.6.4 The Hotspot Lifecycle (useful for viva)
+
+```
+Hotspot lifecycle:
+    TO_REVIEW ──► REVIEWED ──► [ Safe | Acknowledged | Fixed ]
+                  (human must click a status — Sonar never auto-resolves)
+
+Gate impact:
+    Any TO_REVIEW hotspot in new code  →  Security Rating = B  →  Gate fails
+    All hotspots reviewed (any status) →  Security Rating = A  →  Gate passes
+
+Difference from Issues:
+    Issue    — Sonar is confident: "this IS a problem, fix it."
+    Hotspot  — Sonar is uncertain: "this MIGHT be a problem, judge it."
+```
+
+**Result of Round 6:** Security Hotspots Reviewed: **100%**. Security Rating: **A**. Quality Gate: **Passed**. 0 new issues. Coverage 50.9%. 9.3k LoC. 314 tests green.
+
+---
+
+## 3.7 Summary Table — All Issues Resolved
 
 | Issue Category | Round | Rule | Count | Fix |
 |---|---|---|---|---|
@@ -2605,10 +2705,12 @@ private static final String LBL_OPEN_LOOKUP = LBL_OPEN_LOOKUP;  // compile error
 | `@WebMvcTest` breaking on new auth | 4 | (follow-up) | 12 | `@AutoConfigureMockMvc(addFilters = false)` |
 | Duplicate literal "1,2,3" (MemberRegistry) | 5 | `java:S1192` | 1 | Extract `SAMPLE_ID_CSV` constant |
 | Duplicate literal "Open Lookup" (TeamRegistry) | 5 | `java:S1192` | 1 | Extract `LBL_OPEN_LOOKUP` constant |
+| CSRF disabled on `/api/**` chain | 6 (hotspot) | `java:S4502` | 1 | Reviewed **Safe** — stateless + Basic + CORS allowlist |
+| Missing SRI on jsdelivr CDN links | 6 (hotspot) | `Web:S5725` | 3 | Reviewed **Safe** — version-pinned, HTTPS, internal deploy |
 
-**Total: 165 individual issue instances resolved across 5 rounds. 314 tests passing, 0 new Sonar issues, Quality Gate back to green.**
+**Total: 169 individual artefacts resolved across 6 rounds — 165 Issues + 4 Hotspots. 314 tests passing, 0 new Issues, 100% Hotspots Reviewed, Security Rating A, Quality Gate PASSED.**
 
-## 3.7 How to Avoid Common Issues in a Future Spring Boot Project
+## 3.8 How to Avoid Common Issues in a Future Spring Boot Project
 
 A cheat sheet based on what bit us:
 
@@ -2634,6 +2736,10 @@ A cheat sheet based on what bit us:
 20. **Credentials → env vars with empty defaults.** `${APP_ADMIN_PASSWORD:}` beats `${APP_ADMIN_PASSWORD:admin123}` — the blank default forces deployers to pick a real value.
 21. **In registry/lookup classes full of repeated labels, sample values, or URLs, keep a `// Shared literal constants` block at the top of the class.** Every new constant lands there by convention. Saves another Round of S1192 cleanup down the line.
 22. **When extracting a constant via find-and-replace, exclude the declaration line.** Or use the IDE's "Introduce Constant" refactoring (`Ctrl+Alt+C` in IntelliJ) — it handles self-reference protection automatically.
+23. **Hotspots are not bugs — they're decisions.** Every `csrf.disable()`, `new Random()`, CDN `<script>` tag, or `.password()` setter is security-sensitive. Review each one, mark **Safe/Fixed/Acknowledged**, and *write the justification*. Future you will thank you.
+24. **Pin CDN URLs to exact versions, serve over HTTPS, and add SRI hashes.** Version-pinning alone is pragmatic-safe; SRI is defence-in-depth. For internal projects, document why SRI isn't applied. For prod, apply it.
+25. **When disabling CSRF, do it per-chain (`securityMatcher("/api/**")`), not globally.** Keep form-login views under a separate `SecurityFilterChain` where CSRF stays ON.
+26. **Before you ship, Security Hotspots Reviewed must be 100%.** An un-reviewed hotspot quietly drops your Security Rating to B and fails any strict Quality Gate.
 
 ---
 ---
@@ -3424,6 +3530,55 @@ Use the IDE's "Introduce Constant" refactoring (IntelliJ: `Ctrl+Alt+C`, Eclipse:
 
 **Q250. What's the total count of issues resolved across all 5 rounds?**
 165 individual issue instances — from 119 original + 40 uncovered in later scans + 2 Round-4 + 2 Round-5 + follow-up work (12 test-class refactors counted as touch-points). Quality Gate is green, `MQR` mode shows 0 new issues.
+
+## Sub-section L — Round 6 Security Hotspots (Q251-Q265)
+
+**Q251. What's a Security Hotspot in SonarQube?**
+Code that is *security-sensitive* but not necessarily buggy — Sonar can't tell without context whether it's safe. Examples: `csrf.disable()`, `new Random()` (is it used for security?), CDN `<script>` without SRI, password fields. Requires human review — no auto-resolution.
+
+**Q252. Difference between a Vulnerability and a Hotspot?**
+Vulnerability = Sonar is confident there IS an exploit (e.g. SQL injection). Hotspot = Sonar is uncertain, needs a human to judge. Hotspots don't block the gate on severity alone — they block it via the "Hotspots Reviewed = 100%" condition.
+
+**Q253. How many hotspots did your project produce?**
+Four total — 1 CSRF (`java:S4502`, High priority) and 3 Subresource-Integrity (`Web:S5725`, Low priority).
+
+**Q254. What are the four hotspot statuses?**
+`TO_REVIEW` (default until someone looks at it), then after review: `Safe`, `Acknowledged`, or `Fixed`.
+
+**Q255. Safe vs Acknowledged vs Fixed — when to use which?**
+- **Safe** — code is security-sensitive in general, but not exploitable in *this* context. No code change.
+- **Acknowledged** — we know it's risky, accept the risk, no fix planned yet.
+- **Fixed** — the code was changed to remove the sensitivity (e.g. SRI hash added).
+
+**Q256. Why did you mark the CSRF hotspot as Safe?**
+The `/api/**` chain uses `SessionCreationPolicy.STATELESS` (no JSESSIONID cookie), HTTP Basic auth (Authorization header is never auto-sent cross-origin by browsers), and CORS restricted to an allowlist. A CSRF attack requires the browser to auto-attach a credential — none of those mechanisms qualify. Form-login views stay under the separate `webSecurityFilterChain` where CSRF remains enabled.
+
+**Q257. Why not leave CSRF enabled on `/api/**` too?**
+Spring's CSRF filter requires a token on every state-changing method (POST/PUT/DELETE). REST clients (our frontend's `RestTemplate`, curl, Postman) don't naturally fetch tokens. You'd have to expose a `/csrf` endpoint and make every client do a token-fetch dance — all for zero added security, since the chain is already stateless+Basic+CORS-gated.
+
+**Q258. What's SRI (Subresource Integrity)?**
+An `integrity="sha384-..."` attribute on `<script>` / `<link>`. The browser computes the SHA-384 of the downloaded file and refuses to execute it unless the hash matches. Defence against CDN compromise or MITM.
+
+**Q259. Why are the 3 SRI hotspots Safe in our setup?**
+The CDN URLs are version-pinned (`bootstrap@5.3.2`, `bootstrap-icons@1.11.3`) — jsdelivr's policy is immutable versioning, they never republish the same version with different bytes. Combined with HTTPS (TLS integrity) and an internal/demo threat model, the residual risk is very low.
+
+**Q260. What's the stronger fix for the SRI hotspots?**
+Add `integrity="sha384-..."` + `crossorigin="anonymous"` to each CDN `<link>` / `<script>` tag. Bootstrap ships official SRI hashes in their docs; Bootstrap Icons doesn't, so grab theirs from jsdelivr's file page or self-host the `.min.css` + font files under `src/main/resources/static/icons/`.
+
+**Q261. Why does the Security Hotspots Reviewed metric matter?**
+Until every hotspot is reviewed (any status), Security Rating drops to **B**, which fails the default "Security Rating = A" gate condition. Reviewing each one flips the rating back to A.
+
+**Q262. Where do you review hotspots on the dashboard?**
+Project → Security Hotspots tab → filter by "To Review" → click a hotspot → "Change Status" button → pick Safe/Acknowledged/Fixed → add a comment → Save.
+
+**Q263. Can you review hotspots via the API?**
+Yes — `POST /api/hotspots/change_status?hotspot=KEY&status=REVIEWED&resolution=SAFE&comment=...`. Useful for bulk review in CI scripts.
+
+**Q264. Where did you add an inline justification comment for the CSRF hotspot?**
+In `SecurityConfig.java`, directly above `.csrf(csrf -> csrf.disable())`. The comment explains the stateless + Basic + CORS reasoning so any future reader understands without digging through SonarQube history.
+
+**Q265. Security Rating and Hotspots — final state?**
+Security Rating: **A**. Hotspots Reviewed: **100%** (4/4 marked Safe). Quality Gate: **Passed** across both New Code and Overall Code. Activity timeline shows April 21 at 07:46 was the first green scan after Round 5, with Round 6 hotspot reviews completing the journey.
 
 ---
 
