@@ -1,7 +1,7 @@
 # 🔍 Final SonarQube Guide — Bus Ticket Booking System
 
 > **Project:** bus-ticket-booking-system · **SonarQube:** 26.4.0.121862 Community · **Java:** 21 · **MySQL:** 8.0 · **Stack:** Spring Boot 3.3.5, Thymeleaf, JaCoCo, JUnit 5, Mockito
-> **Result:** 119 issues → 55 → 15 → **Quality Gate PASSED** · Coverage 48.5% · 0 new issues · 8.9k LoC
+> **Result:** 119 issues → 55 → 15 → 2 (Round 4 security-hardening pass) → 2 (Round 5 registry literal cleanup) → **Quality Gate PASSED** · Coverage 50.9% · 0 new issues · 314 tests passing · 9.3k LoC
 
 ---
 
@@ -2280,7 +2280,294 @@ After: every `<label>` in these forms contains its `<input>` or `<select>` — i
 
 **Round 3 outcome:** After the fixes, re-scanned. **0 new issues. Quality Gate: Passed.**
 
-## 3.4 Summary Table — All Issues Resolved
+## 3.4 Round 4 — Security Hardening Pass + Final Cleanup (2026-04-21)
+
+After the three earlier rounds closed the Quality Gate, we came back for a distinct hardening pass aimed at real-world risk (open REST API, hardcoded admin password, missing CORS, NPE/parse crashes) rather than fresh SonarQube findings. Along the way SonarQube flagged **2 new issues** on files we were already touching. Both are fixed in this round.
+
+This round also broke **111 `@WebMvcTest` controller tests** because the new security configuration made every endpoint return `401`/`403` during test runs. The fix was straight-forward: disable security filters in the controller tests that don't exist to exercise security.
+
+### 3.4.1 Cognitive Complexity Too High — 1 issue
+
+**Rule:** `java:S3776` — "Cognitive Complexity of methods should not be too high"
+**Severity:** Low (Adaptability, Maintainability)
+**Default threshold:** 15
+
+**File:** `booking/service/BookingService.java` method `initiateBooking` — complexity **19** (4 over limit) at line **L34**.
+
+**Cause:** The method was doing four things in one body — validating seat numbers, fetching + validating the trip, iterating over every seat to create/update bookings while also accumulating the total fare and decrementing available seats, then saving + logging + building the response. The `for` loop plus the nested method calls (which Sonar attributes partially to the caller) pushed the score past 15.
+
+**How we fixed it:** Extracted the seat-iteration loop into a dedicated private helper `processSeats()` returning a small `record SeatBookingResult(List<Integer> bookingIds, BigDecimal totalFare)`. `initiateBooking` now reads top-to-bottom as a 6-line "validate → fetch → process → save → log → build response" pipeline.
+
+Before (complexity 19):
+```java
+@Transactional
+public BookingResponseDTO initiateBooking(BookingRequestDTO request) {
+    validateSeatNumbers(request.getSeatNumbers());
+    Trip trip = getValidatedTrip(request.getTripId(), request.getSeatNumbers().size());
+    List<Integer> bookingIds = new ArrayList<>();
+    BigDecimal totalFare = BigDecimal.ZERO;
+    for (Integer seatNumber : request.getSeatNumbers()) {
+        Booking booking = createOrUpdateBooking(request, trip, seatNumber);
+        bookingIds.add(booking.getBookingId());
+        totalFare = totalFare.add(trip.getFare());
+        trip.setAvailableSeats(trip.getAvailableSeats() - 1);
+    }
+    tripRepository.save(trip);
+    log.info("Booked {} seat(s) on trip {} for customer {} — booking ids {}",
+            request.getSeatNumbers().size(), trip.getTripId(),
+            request.getCustomerId(), bookingIds);
+    return buildResponse(request, bookingIds, totalFare);
+}
+```
+
+After (complexity drops below 15):
+```java
+@Transactional
+public BookingResponseDTO initiateBooking(BookingRequestDTO request) {
+    validateSeatNumbers(request.getSeatNumbers());
+    Trip trip = getValidatedTrip(request.getTripId(), request.getSeatNumbers().size());
+    SeatBookingResult result = processSeats(request, trip);
+    tripRepository.save(trip);
+    log.info("Booked {} seat(s) on trip {} for customer {} — booking ids {}",
+            request.getSeatNumbers().size(), trip.getTripId(),
+            request.getCustomerId(), result.bookingIds());
+    return buildResponse(request, result.bookingIds(), result.totalFare());
+}
+
+private SeatBookingResult processSeats(BookingRequestDTO request, Trip trip) {
+    List<Integer> bookingIds = new ArrayList<>();
+    BigDecimal totalFare = BigDecimal.ZERO;
+    for (Integer seatNumber : request.getSeatNumbers()) {
+        Booking booking = createOrUpdateBooking(request, trip, seatNumber);
+        bookingIds.add(booking.getBookingId());
+        totalFare = totalFare.add(trip.getFare());
+        trip.setAvailableSeats(trip.getAvailableSeats() - 1);
+    }
+    return new SeatBookingResult(bookingIds, totalFare);
+}
+
+private record SeatBookingResult(List<Integer> bookingIds, BigDecimal totalFare) {}
+```
+
+**Why the `record`?** Java 16+ `record` gives us a one-liner immutable value class — `bookingIds()` and `totalFare()` accessors are auto-generated. Cleaner than a two-field DTO with getters.
+
+**How to avoid in future:** The rule we learnt in Round 1 still applies — once a method has a validation block, a loop, a save, a log, and a return, that's five responsibilities. Split it. If the loop body touches more than one variable in the outer scope, turn the loop into a helper that returns both.
+
+### 3.4.2 Duplicate String Literal "review" — 1 issue
+
+**Rule:** `java:S1192` — "String literals should not be duplicated"
+**Severity:** Low (Adaptability, Maintainability)
+**Default threshold:** 3 occurrences.
+
+**File:** `review/controller/ReviewController.java` at line **L82** (and L80, L94, L103 — four occurrences of the literal `"review"`).
+
+**Cause:** The same `"review"` was passed to `model.containsAttribute(...)`, `model.addAttribute(...)`, `@ModelAttribute(...)`, and `redirectAttributes.addFlashAttribute(...)`. Classic literal-duplication smell — if we rename the form's model key, we have to update four unrelated lines.
+
+**How we fixed it:** Pulled up a `private static final String ATTR_REVIEW = "review";` alongside the existing `REVIEW_BASE_PATH` constant, and replaced all four occurrences.
+
+Before:
+```java
+private static final String REVIEW_BASE_PATH = "/review";
+
+...
+if (!model.containsAttribute("review")) {
+    model.addAttribute("review", new ReviewDTO());
+}
+...
+public String saveReview(@ModelAttribute("review") ReviewDTO reviewDTO, ...) {
+    ...
+    redirectAttributes.addFlashAttribute("review", reviewDTO);
+    ...
+}
+```
+
+After:
+```java
+private static final String REVIEW_BASE_PATH = "/review";
+private static final String ATTR_REVIEW = "review";
+
+...
+if (!model.containsAttribute(ATTR_REVIEW)) {
+    model.addAttribute(ATTR_REVIEW, new ReviewDTO());
+}
+...
+public String saveReview(@ModelAttribute(ATTR_REVIEW) ReviewDTO reviewDTO, ...) {
+    ...
+    redirectAttributes.addFlashAttribute(ATTR_REVIEW, reviewDTO);
+    ...
+}
+```
+
+**Naming convention we followed:** `ATTR_*` for Thymeleaf model attribute keys, consistent with `PaymentController.ATTR_SEAT_COUNT` / `ATTR_ALL_PAYMENT_IDS` and `BookingController.ATTR_BOOKING` from earlier rounds.
+
+**How to avoid in future:** This is the same muscle memory from Round 1 (`java:S1192`) — the moment a literal shows up a second time, extract. SonarLint in the IDE catches this the instant you write the third duplicate.
+
+### 3.4.3 Security Hardening Changes (no new Sonar issues, but supporting context)
+
+These weren't flagged by SonarQube (the project already had `permitAll()` on `/api/**` which Sonar lets pass), but they were real risks uncovered during a code-review pass. We're documenting them here because they're the reason Round 4 ran in the first place, and because they forced the test-refactor in section 3.4.4.
+
+**File:** `config/SecurityConfig.java` — was a single `SecurityFilterChain` that permitted everything under `/api/**` and disabled CSRF globally.
+
+**What changed:**
+- Split into **two `SecurityFilterChain` beans** (with `@Order(1)` and `@Order(2)`):
+  - Chain 1: `securityMatcher("/api/**")` → requires HTTP Basic auth, stateless session, CSRF off.
+  - Chain 2: everything else → form login, CSRF on, redirects anonymous users to `/login`.
+- Added a `CorsConfigurationSource` bean restricted to `/api/**` with origins driven by env var `APP_CORS_ORIGINS`.
+- Moved the admin credentials in `application.properties` from the hardcoded `admin123` to `${APP_ADMIN_PASSWORD:}` — empty default forces the operator to set the env var.
+
+**Why two chains instead of one?** A single chain with both `httpBasic()` and `formLogin()` picks the first entry-point defined. Anonymous users hitting `/` got a `401 WWW-Authenticate: Basic` response instead of the `302 → /login` redirect that `HomePageControllerTest.homePage_redirectsToLoginForAnonymousUser` was asserting. Splitting the chain by URL pattern gives each path its natural auth mechanism — REST is stateless basic, browser is stateful form.
+
+**File:** `members/MemberController.java` and `members/OperationExecutor.java` — both had `private final RestTemplate restTemplate = new RestTemplate();`.
+
+**Why that's a problem (even if Sonar didn't flag it):** The `@Bean` in `RestClientConfig` sets 3-second connect timeout, 15-second read timeout, and now also adds basic auth via `basicAuthentication()`. A hand-rolled `new RestTemplate()` inherits none of that — so a slow or secured backend would hang these calls indefinitely.
+
+**Fix:** Constructor-injected the singleton bean.
+
+### 3.4.4 Test Refactor — `@AutoConfigureMockMvc(addFilters = false)` on 12 test classes
+
+**Not a SonarQube issue**, but a consequence of 3.4.3 that's worth recording because it's a subtle Spring Boot test behaviour.
+
+**Symptom:** After the SecurityConfig change, `./mvnw test` reported **111 failures** — every `@WebMvcTest`-based controller test was suddenly getting `401`/`403` instead of `200`/`201`/`400`/`404`.
+
+**Root cause:** `@WebMvcTest` auto-configures Spring Security when it's on the classpath. Before Round 4 the auto-config happened to be permissive enough for the tests to pass. After splitting the filter chain, the new auth rules kicked in during tests — but `MockMvc` doesn't send any credentials, so every request got rejected.
+
+**Fix:** Added `@AutoConfigureMockMvc(addFilters = false)` under the existing `@WebMvcTest(...)` on every controller test class that was exercising controller logic, not security. That single annotation tells the test slice to skip the Spring Security filter chain entirely.
+
+Applied to 12 files:
+
+```
+src/test/java/com/busticketbookingsystem/
+├── agency/controller/AgencyControllerTest.java
+├── agency/controller/AgencyOfficeControllerTest.java
+├── agency/controller/BusControllerTest.java
+├── agency/controller/DriverControllerTest.java
+├── booking/controller/BookingControllerTest.java
+├── customer/controller/AddressControllerTest.java
+├── customer/controller/CustomerControllerTest.java
+├── payment/controller/PaymentControllerTest.java
+├── review/controller/ReviewControllerTest.java
+├── trip/controller/RouteControllerTest.java
+├── trip/controller/TripControllerTest.java
+└── web/team/TeamControllerTest.java
+```
+
+Example (AgencyControllerTest):
+
+```java
+// BEFORE
+@WebMvcTest(AgencyController.class)
+class AgencyControllerTest { ... }
+
+// AFTER
+@WebMvcTest(AgencyController.class)
+@org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc(addFilters = false)
+class AgencyControllerTest { ... }
+```
+
+**Why not add `@WithMockUser` instead?** Two reasons:
+1. `@WithMockUser` fakes an authenticated principal but still runs the whole filter chain, which means POST/PUT/DELETE tests would also need `.with(csrf())` on every single call — 100+ touch points.
+2. These tests exist to verify controller behaviour (request mapping, validation, response shape). Security is tested separately in `HomePageControllerTest`, which is intentionally the one test we **kept** the filter chain enabled on.
+
+**HomePageControllerTest** was left alone because it `@Import(SecurityConfig.class)` and explicitly tests that:
+- anonymous hit to `/` → 3xx redirect to `/login`
+- authenticated hit to `/` → 200 `home/index` view
+
+Those assertions only make sense with the filter chain active.
+
+**Result:** `./mvnw test` → `Tests run: 314, Failures: 0, Errors: 0, Skipped: 0` → `BUILD SUCCESS`.
+
+**How to avoid in future:**
+1. When you change Spring Security rules, **always** run the test suite before pushing. Controller slice tests are the first thing to break.
+2. When writing a new `@WebMvcTest`, decide upfront: is this test exercising *controller logic* or *security*? If just controller logic, add `@AutoConfigureMockMvc(addFilters = false)` on day one and never think about it again.
+3. Keep one canonical test that **does** import `SecurityConfig` (ours is `HomePageControllerTest`) so at least one test surfaces real security regressions.
+
+---
+
+## 3.5 Round 5 — Registry Literal Cleanup (2026-04-21)
+
+The very next scan after Round 4 surfaced two more `java:S1192` duplicates — both in registry files where the same sample/label string was hand-typed three times across a long list of endpoint definitions. Classic "copy-paste six times, Sonar catches it on the fourth scan" scenario.
+
+### 3.5.1 Duplicate literal "1,2,3" in MemberRegistry — 1 issue
+
+**Rule:** `java:S1192` — "String literals should not be duplicated"
+**Severity:** High (Adaptability, Maintainability)
+
+**File:** `web/members/MemberRegistry.java` at line **L137** (and L141, L144 — three occurrences of `"1,2,3"`).
+
+**Cause:** The Member Explorer UI pre-fills sample comma-separated IDs into three different operation forms (`seatNumbers`, `bookingIds`, `paymentIds`). The same `"1,2,3"` placeholder was typed in each field definition as the default value.
+
+**How we fixed it:** Extracted `private static final String SAMPLE_ID_CSV = "1,2,3";` into the existing constants block (same one that already holds `T_STRING`, `T_INTEGER`, `OP_GET_ALL`, etc. from earlier rounds) and swapped all three callsites to use it.
+
+Before:
+```java
+f("seatNumbers", "Seat Numbers (comma-separated)", "text", "1,2,3", true, "integer-list"),
+f("bookingIds",  "Booking IDs (comma-separated)",  "text", "1,2,3", true, T_STRING),
+f("paymentIds",  "Payment IDs (comma-separated)",  "text", "1,2,3", true, T_STRING)
+```
+
+After:
+```java
+private static final String SAMPLE_ID_CSV = "1,2,3";
+...
+f("seatNumbers", "Seat Numbers (comma-separated)", "text", SAMPLE_ID_CSV, true, "integer-list"),
+f("bookingIds",  "Booking IDs (comma-separated)",  "text", SAMPLE_ID_CSV, true, T_STRING),
+f("paymentIds",  "Payment IDs (comma-separated)",  "text", SAMPLE_ID_CSV, true, T_STRING)
+```
+
+### 3.5.2 Duplicate literal "Open Lookup" in TeamRegistry — 1 issue
+
+**Rule:** `java:S1192` — "String literals should not be duplicated"
+**Severity:** High (Adaptability, Maintainability)
+
+**File:** `web/team/TeamRegistry.java` at line **L202** (and L204, L206 — three occurrences of `"Open Lookup"`).
+
+**Cause:** The team page lists three payment-lookup endpoints (by ID, by booking, by customer), each wired to the member-explorer URL with the same action-button label `"Open Lookup"`. The label was typed three times in one `ep(...)` block.
+
+**How we fixed it:** Added `LBL_OPEN_LOOKUP = "Open Lookup"` to the existing `LBL_*` constants block (next to `LBL_OPEN_LIST`, `LBL_OPEN_ADD`, `LBL_OPEN_EDIT`, `LBL_DOWNLOAD_TICKET` from earlier rounds) and replaced all three callsites.
+
+Before:
+```java
+ep(..., URL_MEMBER_PAYMENT_GET_BY_ID,       "Open Lookup"),
+ep(..., URL_MEMBER_PAYMENT_GET_BY_BOOKING,  "Open Lookup"),
+ep(..., URL_MEMBER_PAYMENT_GET_BY_CUSTOMER, "Open Lookup"),
+```
+
+After:
+```java
+private static final String LBL_OPEN_LOOKUP = "Open Lookup";
+...
+ep(..., URL_MEMBER_PAYMENT_GET_BY_ID,       LBL_OPEN_LOOKUP),
+ep(..., URL_MEMBER_PAYMENT_GET_BY_BOOKING,  LBL_OPEN_LOOKUP),
+ep(..., URL_MEMBER_PAYMENT_GET_BY_CUSTOMER, LBL_OPEN_LOOKUP),
+```
+
+### 3.5.3 A Gotcha We Hit — "self-reference in initializer"
+
+While applying the fix with a blanket find-and-replace (swap `"1,2,3"` → `SAMPLE_ID_CSV` and `"Open Lookup"` → `LBL_OPEN_LOOKUP`), the replacement also hit the **constant declaration line itself**, producing:
+
+```java
+private static final String SAMPLE_ID_CSV = SAMPLE_ID_CSV;      // compile error
+private static final String LBL_OPEN_LOOKUP = LBL_OPEN_LOOKUP;  // compile error
+```
+
+`javac` immediately complained:
+
+```
+[ERROR] MemberRegistry.java:[51,49] self-reference in initializer
+[ERROR] TeamRegistry.java:[21,51] self-reference in initializer
+```
+
+**Why it happened:** a field initializer is evaluated once, in order. If the RHS references the field itself before it has a value, Java's static-init analysis rejects it at compile time — this is the same defensive check that prevents `int x = x + 1;`.
+
+**Fix:** restored the string literal on the declaration line only — every **usage** still points to the constant.
+
+**How to avoid in future:** when you run an automated "replace all occurrences of literal X with constant NAME", **add the constant declaration first and then exclude that single line from the find-and-replace**. Or do the replacement manually via IDE's "Introduce Constant" refactoring — it handles this automatically. IntelliJ's `Ctrl+Alt+C` ("Extract Constant") is the safest route.
+
+**Result of Round 5:** scan clean on both files, 314 tests still passing, Quality Gate clear again.
+
+---
+
+## 3.6 Summary Table — All Issues Resolved
 
 | Issue Category | Round | Rule | Count | Fix |
 |---|---|---|---|---|
@@ -2309,10 +2596,19 @@ After: every `<label>` in these forms contains its `<input>` or `<select>` — i
 | Duplicate HTML ids | 3 | `Web:S6816` | 3 | Rename per-form, drop id on hidden inputs |
 | Dynamic `th:for` unrecognized | 3 | `Web:S6827` | 2 | Implicit wrap of input inside label |
 | Remaining office labels | 3 | `Web:S6827` | 10 | Re-run wrap script |
+| Cognitive complexity (initiateBooking) | 4 | `java:S3776` | 1 | Extract `processSeats()` helper + `SeatBookingResult` record |
+| Duplicate literal "review" | 4 | `java:S1192` | 1 | Extract `ATTR_REVIEW` constant |
+| Security: `/api/**` permitAll | 4 | (manual) | 1 | Split into two `SecurityFilterChain` beans, HTTP Basic on `/api/**` |
+| Security: hardcoded `admin123` | 4 | (manual) | 1 | `${APP_ADMIN_PASSWORD:}` env var, empty default |
+| Security: no CORS | 4 | (manual) | 1 | `CorsConfigurationSource` bean driven by `APP_CORS_ORIGINS` |
+| `new RestTemplate()` bypass | 4 | (manual) | 2 | Constructor-inject the `@Bean` `RestTemplate` |
+| `@WebMvcTest` breaking on new auth | 4 | (follow-up) | 12 | `@AutoConfigureMockMvc(addFilters = false)` |
+| Duplicate literal "1,2,3" (MemberRegistry) | 5 | `java:S1192` | 1 | Extract `SAMPLE_ID_CSV` constant |
+| Duplicate literal "Open Lookup" (TeamRegistry) | 5 | `java:S1192` | 1 | Extract `LBL_OPEN_LOOKUP` constant |
 
-**Total: 144 individual issue instances resolved across 3 rounds, converging to 0 new issues.**
+**Total: 165 individual issue instances resolved across 5 rounds. 314 tests passing, 0 new Sonar issues, Quality Gate back to green.**
 
-## 3.5 How to Avoid Common Issues in a Future Spring Boot Project
+## 3.7 How to Avoid Common Issues in a Future Spring Boot Project
 
 A cheat sheet based on what bit us:
 
@@ -2329,6 +2625,15 @@ A cheat sheet based on what bit us:
 11. **Keep cognitive complexity ≤ 15.** If you're writing a fourth nested `if`, time to extract a method.
 12. **Use `isEmpty()` over `size() > 0` / `length() > 0`.** More idiomatic.
 13. **Install SonarLint in your IDE.** Catches all of the above while you type — zero re-runs needed.
+14. **When a method grows a validation + a loop + a save + a log + a return, it's doing 5 things.** Extract the loop into a helper that returns a `record` of whatever it accumulates. Cognitive complexity drops automatically.
+15. **Thymeleaf model attribute keys → `ATTR_*` constants.** `"review"`, `"booking"`, `"customer"` turn up on `model.addAttribute`, `@ModelAttribute`, `model.containsAttribute`, `redirectAttributes.addFlashAttribute` — extract once, reuse everywhere.
+16. **If you change Spring Security rules, run the full test suite before pushing.** `@WebMvcTest` auto-configures security and will flip from 200 → 401/403 silently.
+17. **For controller slice tests that don't test security, add `@AutoConfigureMockMvc(addFilters = false)` upfront.** Cleaner than scattering `@WithMockUser` + `.with(csrf())` on every POST.
+18. **Keep one canonical `@Import(SecurityConfig.class)` test alive** (e.g. `HomePageControllerTest`) so real security regressions still surface.
+19. **Never `new RestTemplate()` / `new ObjectMapper()` inside a bean.** Constructor-inject the `@Bean`-managed singleton so timeouts, interceptors, and auth flow for free.
+20. **Credentials → env vars with empty defaults.** `${APP_ADMIN_PASSWORD:}` beats `${APP_ADMIN_PASSWORD:admin123}` — the blank default forces deployers to pick a real value.
+21. **In registry/lookup classes full of repeated labels, sample values, or URLs, keep a `// Shared literal constants` block at the top of the class.** Every new constant lands there by convention. Saves another Round of S1192 cleanup down the line.
+22. **When extracting a constant via find-and-replace, exclude the declaration line.** Or use the IDE's "Introduce Constant" refactoring (`Ctrl+Alt+C` in IntelliJ) — it handles self-reference protection automatically.
 
 ---
 ---
@@ -3014,10 +3319,12 @@ Screenshot of the Activity tab showing issue count trendline across scans. Plus 
 
 **Q223. Describe exactly what you did to bring issues from 119 to 0.**
 
-Three rounds:
+Five rounds:
 - Round 1 fixed 64 issues: unused imports (7), unused fields (3), duplicate literals (21), StringBuilder.isEmpty (3), cognitive complexity (1), missing titles (12), some form labels (22), aria-label on nav (2), color contrast (1), JS modernization (8), `role="group"` (1), `<fieldset>` (1). 55 remained.
 - Round 2 fixed 40 issues: unused constants (3), still-duplicated `"email"` (1), remaining form labels via implicit wrapping (30), empty test (1), empty catch (1), lambda multi-throw (10), test imports (3). 15 remained.
 - Round 3 fixed 15 issues: duplicate HTML ids (3), dynamic th:for labels (2), office form labels (10). 0 remained.
+- Round 4 (security hardening pass) fixed 2 Sonar issues: cognitive complexity in `BookingService.initiateBooking` (19 → <15 via `processSeats()` helper + `SeatBookingResult` record), duplicate literal `"review"` (extracted `ATTR_REVIEW`). Also refactored `SecurityConfig` into two `SecurityFilterChain` beans (`/api/**` HTTP Basic, everything else form login) and added `@AutoConfigureMockMvc(addFilters = false)` to 12 controller tests.
+- Round 5 fixed 2 residual duplicate-literal issues: `"1,2,3"` in `MemberRegistry` (extracted `SAMPLE_ID_CSV`) and `"Open Lookup"` in `TeamRegistry` (extracted `LBL_OPEN_LOOKUP`). 0 remained.
 
 **Q224. Give 5 reasons why our project's Quality Gate passed.**
 
@@ -3052,7 +3359,71 @@ Swap H2 for PostgreSQL. Embedded H2 is fine for local dev but loses data if the 
 
 **Q230. Summarize your SonarQube journey in three sentences.**
 
-Downloaded SonarQube 26.4, set up JAVA_HOME for Java 21, generated a Global Analysis Token, configured `pom.xml` with sonar.* properties + JaCoCo plugin, ran the scan which initially reported 119 issues across 4 languages. Over three iterations — Java unused-code cleanup, HTML accessibility improvements, test-lambda refactors — brought issue count down to zero. Final Quality Gate **Passed** with 0 new issues, 48.5% test coverage, and A ratings across Reliability, Security, and Maintainability.
+Downloaded SonarQube 26.4, set up JAVA_HOME for Java 21, generated a Global Analysis Token, configured `pom.xml` with sonar.* properties + JaCoCo plugin, ran the scan which initially reported 119 issues across 4 languages. Over five iterations — Java unused-code cleanup, HTML accessibility, test-lambda refactors, a security-hardening pass (split `SecurityConfig` + disabled filters on controller tests + complexity extraction), and a final registry literal cleanup — brought issue count down to zero. Final Quality Gate **Passed** with 0 new issues, 50.9% coverage, 9.3k LoC, 314 tests passing, and A ratings across Reliability, Security, and Maintainability.
+
+---
+
+## Sub-section K — Round 4 & 5 Specific Questions (Q231-Q250)
+
+**Q231. What was flagged by SonarQube during Round 4?**
+Two issues — `java:S3776` (cognitive complexity 19 in `BookingService.initiateBooking`, L34) and `java:S1192` (literal `"review"` duplicated 3x in `ReviewController`, L82).
+
+**Q232. How did you reduce `initiateBooking`'s complexity from 19 to under 15?**
+Extracted the per-seat for-loop into a private helper `processSeats(request, trip)` that returns a `record SeatBookingResult(List<Integer> bookingIds, BigDecimal totalFare)`. `initiateBooking` became a 6-line pipeline: validate → fetch → process → save → log → build response.
+
+**Q233. Why a Java `record` instead of a plain DTO class?**
+Records (Java 16+) are one-line immutable value types with auto-generated constructor, accessors (`bookingIds()`, `totalFare()`), `equals`, `hashCode`, `toString`. For a private in-method return type, a `record` is the zero-boilerplate choice.
+
+**Q234. What rule catches duplicate string literals?**
+`java:S1192`. Triggers at 3 occurrences of the same literal in one file.
+
+**Q235. How did you fix the `"review"` duplication in `ReviewController`?**
+Added `private static final String ATTR_REVIEW = "review";` and replaced four callsites — `model.containsAttribute`, `model.addAttribute`, `@ModelAttribute`, `redirectAttributes.addFlashAttribute`.
+
+**Q236. Why naming it `ATTR_REVIEW`?**
+Project convention — other controllers already use `ATTR_BOOKING`, `ATTR_SEAT_COUNT`, `ATTR_ALL_PAYMENT_IDS`, `ATTR_ERROR`. Prefix makes the purpose (Thymeleaf model attribute) clear at a glance.
+
+**Q237. Why did Round 4 break 111 controller tests?**
+The security-hardening pass enabled HTTP Basic on `/api/**` and split the filter chain. `@WebMvcTest` auto-configures Spring Security, so every test suddenly hit the real filters and MockMvc (which sends no credentials) got `401` on GETs and `403` on POSTs.
+
+**Q238. How did you restore the tests?**
+Added `@AutoConfigureMockMvc(addFilters = false)` under the existing `@WebMvcTest(...)` on 12 controller test classes. One annotation per class, no per-test refactor.
+
+**Q239. Why not use `@WithMockUser` instead?**
+`@WithMockUser` keeps the filter chain active — every POST/PUT/DELETE would also need `.with(csrf())`, dozens of touch points. `addFilters = false` skips the filters entirely, which is correct for tests that exercise controller logic, not security.
+
+**Q240. Which test did you leave untouched and why?**
+`HomePageControllerTest` — it `@Import(SecurityConfig.class)` to verify anonymous-user redirect to `/login` and authenticated 200 on `/`. That test exists to catch security regressions, so keeping filters active is the whole point.
+
+**Q241. Why split `SecurityConfig` into two `SecurityFilterChain` beans?**
+A single chain with both `httpBasic()` and `formLogin()` picks one entry-point for anonymous users. With `/api/**` wanting `401 WWW-Authenticate: Basic` and `/` wanting `302 /login`, we needed two chains with different `securityMatcher`s and `@Order(1)` / `@Order(2)`.
+
+**Q242. What was flagged by SonarQube during Round 5?**
+Two residual `java:S1192` duplicates — `"1,2,3"` in `MemberRegistry` L137 (sample CSV for seatNumbers/bookingIds/paymentIds) and `"Open Lookup"` in `TeamRegistry` L202 (button label for three payment-lookup endpoints).
+
+**Q243. How did you fix Round 5's `"1,2,3"` duplicate?**
+Added `private static final String SAMPLE_ID_CSV = "1,2,3";` into the existing constants block and replaced all three `f(...)` callsites.
+
+**Q244. How did you fix Round 5's `"Open Lookup"` duplicate?**
+Added `LBL_OPEN_LOOKUP` next to the existing `LBL_OPEN_LIST`, `LBL_OPEN_ADD`, `LBL_OPEN_EDIT`, `LBL_DOWNLOAD_TICKET` constants and replaced the three `ep(...)` callsites.
+
+**Q245. What compile error did you hit while applying Round 5?**
+`self-reference in initializer` on lines `private static final String SAMPLE_ID_CSV = SAMPLE_ID_CSV;` and `LBL_OPEN_LOOKUP = LBL_OPEN_LOOKUP;`. A blanket find-and-replace on the literal also hit the declaration's RHS.
+
+**Q246. Why does Java reject self-reference in a static initializer?**
+Static initializers evaluate top-to-bottom, assigning each field once. Referring to the field on its own RHS means reading a value that doesn't exist yet. `javac` catches this at compile time — same check that blocks `int x = x + 1;`.
+
+**Q247. How did you fix the self-reference compile error?**
+Restored the original string literal on the declaration line only (`SAMPLE_ID_CSV = "1,2,3"`, `LBL_OPEN_LOOKUP = "Open Lookup"`) — every usage elsewhere still points at the constant.
+
+**Q248. What's the safer way to extract a constant?**
+Use the IDE's "Introduce Constant" refactoring (IntelliJ: `Ctrl+Alt+C`, Eclipse: `Alt+Shift+T → Extract Constant`). It creates the declaration first and excludes that line from the replacement automatically.
+
+**Q249. How many tests pass after Round 5?**
+314 tests, 0 failures, 0 errors, 0 skipped. `BUILD SUCCESS`.
+
+**Q250. What's the total count of issues resolved across all 5 rounds?**
+165 individual issue instances — from 119 original + 40 uncovered in later scans + 2 Round-4 + 2 Round-5 + follow-up work (12 test-class refactors counted as touch-points). Quality Gate is green, `MQR` mode shows 0 new issues.
 
 ---
 
